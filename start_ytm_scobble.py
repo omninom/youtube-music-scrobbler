@@ -9,7 +9,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import set_key
@@ -30,7 +30,14 @@ AVG_TRACK_MINUTES = 4
 DEFAULT_SCROBBLE_TIMEZONE = "Asia/Kolkata"
 
 
-def get_scrobble_timezone() -> ZoneInfo:
+def _fallback_scrobble_timezone() -> tzinfo:
+    """Return a fixed offset fallback when IANA timezone data is unavailable."""
+    if DEFAULT_SCROBBLE_TIMEZONE == "Asia/Kolkata":
+        return timezone(timedelta(hours=5, minutes=30), name=DEFAULT_SCROBBLE_TIMEZONE)
+    return timezone.utc
+
+
+def get_scrobble_timezone() -> tzinfo:
     """Resolve configured timezone with safe fallback."""
     timezone_name = os.environ.get("SCROBBLE_TIMEZONE", DEFAULT_SCROBBLE_TIMEZONE).strip() or DEFAULT_SCROBBLE_TIMEZONE
     try:
@@ -41,7 +48,14 @@ def get_scrobble_timezone() -> ZoneInfo:
             timezone_name,
             DEFAULT_SCROBBLE_TIMEZONE,
         )
-        return ZoneInfo(DEFAULT_SCROBBLE_TIMEZONE)
+        try:
+            return ZoneInfo(DEFAULT_SCROBBLE_TIMEZONE)
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                "Default timezone '%s' is unavailable. Falling back to a fixed offset.",
+                DEFAULT_SCROBBLE_TIMEZONE,
+            )
+            return _fallback_scrobble_timezone()
 
 
 def get_scrobble_now() -> datetime:
