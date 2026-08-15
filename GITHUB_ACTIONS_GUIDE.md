@@ -6,13 +6,13 @@ This guide explains how to configure and use GitHub Actions to automatically run
 
 Instead of running the scrobbler manually, you can use a GitHub Actions workflow to run it automatically. This automates the process of fetching your YouTube Music history and scrobbling it to Last.fm. To do this securely, we use GitHub Secrets to store your sensitive information instead of committing them to the repository.
 
-**Recommended Approach:** Use [cron-job.org](https://cron-job.org) to trigger the workflow externally for more reliable execution timing. See the [README](README.md#-automation-recommended-cron-joborg) for quick setup instructions.
+**Recommended Approach:** Use the built-in GitHub Actions scheduler (`.github/workflows/sync.yml`) configured for 30-minute interval sync with odd minute offsets (`cron: '17,47 * * * *'`).
 
 The workflow runs:
-- On a schedule (once daily at 23:55 IST) - **commented out by default** (using cron-job.org instead)
+- Automatically every 30 minutes on an odd-offset schedule (`17,47 * * * *`)
 - On pushes to the master branch
-- Manually via the GitHub Actions UI
-- With automatic cookie validation and Discord notifications
+- Manually via the GitHub Actions UI (`workflow_dispatch`)
+- With automatic cookie validation and Discord notifications (suppressed when 0 songs scrobbled)
 
 ## 1. Configuring Secrets
 
@@ -28,7 +28,7 @@ You need to add the following secrets to your GitHub repository. It is recommend
 
 ### Optional Environment Variable (Non-Secret)
 
--   `SCROBBLE_TIMEZONE`: IANA timezone used for report date/listening flow buckets (default: `Asia/Kolkata`)
+-   `SCROBBLE_TIMEZONE`: IANA timezone used for report date (default: `Asia/Kolkata`)
 
 ### Security: Encrypting your YouTube Music Auth
 

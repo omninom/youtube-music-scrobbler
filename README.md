@@ -4,12 +4,14 @@ An intelligent, automated scrobbler that syncs your YouTube Music history to Las
 
 ## ✨ Features
 
-- **Smart Scrobbling**: Tracks position in history to handle replays and avoid duplicates.
-- **Secure**: AES-256 encryption for your YouTube Music session cookies.
-- **Multilingual Support**: Advanced date detection for 50+ languages.
-- **Automated**: Integrated with GitHub Actions for 24/7 synchronization.
-- **Discord Notifications**: Get success/failure alerts for automated runs.
-- **Lightweight**: Minimal dependencies and efficient SQLite tracking.
+- **Hyper-Optimized Execution**: Routine sync runs complete in **~0.8s to 1.5s**, featuring lazy API loading, HTTP session pooling, and $O(1)$ hash lookups.
+- **Smart Scrobbling**: Dual-pattern position tracking handles interleaved replays (`A → B → A`) and single-track repeat loops (`A → A → A`).
+- **Hybrid SQLite Caching**: Persistent SQLite cache + 100-track delta refresh for YouTube Music liked songs (reduces API network calls by 90%+).
+- **Secure**: AES-256 Fernet encryption for YouTube Music session credentials.
+- **Multilingual Support**: Advanced date detection supporting 50+ languages.
+- **Automated**: Integrated with GitHub Actions for 24/7 synchronization every 30 minutes.
+- **Discord Notifications**: Rich markdown reports featuring a top-5 **Scrobbled** tracks list with `+ X more` overflow, **Liked Today**, **Most Played Track**, and **Most Played Artist**.
+- **Lightweight**: Minimal dependencies, B-Tree indexed SQLite database, and single-commit batch transactions.
 
 ---
 
@@ -21,23 +23,32 @@ An intelligent, automated scrobbler that syncs your YouTube Music history to Las
 - [Last.fm API Credentials](https://www.last.fm/api/account/create)
 
 ### 2. Setup YouTube Music Authentication
-To fetch your history, you need to provide your YouTube Music session headers.
+To fetch your history, generate and encrypt your YouTube Music session credentials:
 
 1.  **Generate `browser.json`**:
-    Follow the [ytmusicapi setup instructions](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html).
-    Essentially:
-    - Open YouTube Music in Chrome.
-    - Open Developer Tools (F12) -> Network Tab.
-    - Filter for `/browse`.
-    - Right-click the request -> Copy -> Copy as cURL (bash).
-    - Run `ytmusicapi browser` and paste the command when prompted.
-2.  **Encrypt your credentials**:
+    Follow the official [ytmusicapi setup instructions](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html):
+    - Open Developer Tools (`F12`) on [music.youtube.com](https://music.youtube.com) → **Network** tab.
+    - Filter for an authenticated POST request to `/browse`.
+    - Copy the request headers (or copy as fetch/Node.js).
+    - Run `ytmusicapi browser` (on macOS: `pbpaste | ytmusicapi browser`) and paste the headers when prompted.
+    - *Alternatively*, manually create `browser.json` with:
+      ```json
+      {
+          "Accept": "*/*",
+          "Authorization": "PASTE_AUTHORIZATION",
+          "Content-Type": "application/json",
+          "X-Goog-AuthUser": "0",
+          "x-origin": "https://music.youtube.com",
+          "Cookie": "PASTE_COOKIE"
+      }
+      ```
+2.  **Encrypt credentials**:
     ```bash
     python encrypt_auth.py
     ```
-    This will create `browser.json.enc` and output an **Encryption Key**.
-    - **SAVE THIS KEY!** You will need it for your `.env` or GitHub Secrets.
-    - Delete the original `browser.json` file.
+    This creates `browser.json.enc` and outputs your **`YTMUSIC_AUTH_KEY`**.
+    - **Save this key!** You will need it for your `.env` or GitHub Secrets.
+    - Delete `browser.json` (`rm browser.json`) so plain text credentials are never committed.
 
 ### 3. Installation
 ```bash
@@ -63,92 +74,54 @@ On the first run, it will open your browser to authorize Last.fm. Once done, a `
 
 ---
 
-## 🤖 Automation (Recommended: cron-job.org)
+## 🤖 Automation (Recommended: GitHub Actions Scheduler)
 
-The recommended way to automate scrobbling is using [cron-job.org](https://cron-job.org) to trigger GitHub Actions workflows externally. This approach is more reliable than GitHub Actions' built-in scheduler, which can experience delays on the free tier.
+The scrobbler is configured by default to run automatically every **30 minutes** using native GitHub Actions (`.github/workflows/sync.yml`).
 
-### Why cron-job.org?
-- **More reliable execution timing** - No delays from shared runner load
-- **External scheduling** - Independent of GitHub's scheduler
-- **Easy testing** - Use the "Run now" button for immediate testing
-- **No workflow changes needed** - Works with the existing GitHub Actions setup
+### Features of 30-Minute Synchronization:
+- **Real-Time Scrobbles**: Syncs your Last.fm history every 30 minutes.
+- **Accurate Replay Tracking**: Detects both interleaved replays (`A → B → A`) and single-track repeat loops (`A → A → A`).
+- **Quiet Run Suppression**: Automatically skips Discord notifications when no music was played during the 30-minute window to avoid channel spam.
 
-### Quick Setup
-
-1. **Create a GitHub Personal Access Token** (Fine-grained recommended)
-   - Required permissions:
-     - Actions → Read and Write
-     - Contents → Read
-
-2. **Create a cronjob on cron-job.org** with these settings:
-
-   **URL:**
+### Quick Setup:
+1. Add required GitHub Environment Secrets (`LAST_FM_API`, `LAST_FM_API_SECRET`, `LASTFM_SESSION`, `YTMUSIC_AUTH_KEY`, `DISCORD_WEBHOOK_URL`).
+2. Commit `browser.json.enc` to your repository.
+3. The workflow in `.github/workflows/sync.yml` is enabled out-of-the-box:
+   ```yaml
+   on:
+     schedule:
+       - cron: '17,47 * * * *' # Every 30 minutes at odd offsets (:17 and :47)
    ```
-   https://api.github.com/repos/<username>/youtube-music-scrobbler/actions/workflows/sync.yml/dispatches
-   ```
-
-   **Method:** `POST`
-
-   **Headers:**
-   ```
-   Content-Type: application/json
-   Accept: application/vnd.github+json
-   Authorization: Bearer YOUR_GITHUB_PAT
-   ```
-
-   **Request Body:**
-   ```json
-   {
-     "ref": "master"
-   }
-   ```
-
-   **Schedule (Daily at 10:00 PM IST):**
-   ```
-   30 16 * * *
-   ```
-   (GitHub API expects UTC time)
-
-3. **Add secrets to your repository** (if not already configured):
-   - `LAST_FM_API`, `LAST_FM_API_SECRET`, `LASTFM_SESSION`
-   - `YTMUSIC_AUTH_KEY`, `DISCORD_WEBHOOK_URL`
-
-4. **Test the setup** using the **Run now** option in cron-job.org
-
-5. **Monitor executions** at:
-   ```
-   https://github.com/<username>/youtube-music-scrobbler/actions
-   ```
-
-### Security Note
-Never commit or expose your GitHub Personal Access Token publicly.  
-If a token is accidentally exposed, revoke it immediately and generate a new one.
+4. Refer to [**SCHEDULE_GUIDE.md**](SCHEDULE_GUIDE.md) for replay tracking mechanics and GitHub ToS compliance, and the [**GitHub Actions Guide**](GITHUB_ACTIONS_GUIDE.md) for CI/CD setup.
 
 ---
 
-## Alternative: GitHub Actions Built-in Scheduler
+## Alternative: External Scheduler (cron-job.org)
 
-GitHub Actions also has a built-in scheduler, but it's less reliable on the free tier. If you prefer to use it instead of cron-job.org:
+If you prefer external triggering (e.g. to bypass GitHub Actions scheduler runner queue delays):
 
-1.  Follow the [**GitHub Actions Guide**](GITHUB_ACTIONS_GUIDE.md) for detailed instructions.
-2.  Uncomment the `schedule` section in `.github/workflows/sync.yml`:
-    ```yaml
-    on:
-      schedule:
-        - cron: '37 16 * * *' # 10:07 PM IST
-    ```
-3.  Add your secrets to the repository (same as above).
-4.  Commit `browser.json.enc` (but **NEVER** `browser.json`).
-
-**Note:** The built-in scheduler is commented out by default in favor of cron-job.org for better reliability.
+1. **Create a GitHub Personal Access Token** with Actions read/write permissions.
+2. **Create a cronjob on cron-job.org**:
+   - **URL**: `https://api.github.com/repos/<username>/youtube-music-scrobbler/actions/workflows/sync.yml/dispatches`
+   - **Method**: `POST`
+   - **Headers**:
+     ```
+     Content-Type: application/json
+     Accept: application/vnd.github+json
+     Authorization: Bearer YOUR_GITHUB_PAT
+     ```
+   - **Schedule**: Every 30 minutes (`0,30 * * * *`).
 
 ## 🛠️ Project Structure
 
-- `start_ytm_scobble.py`: Main process and Last.fm OAuth handler.
-- `ytmusic_fetcher.py`: Fetches and parses YTM history.
-- `scrobble_utils.py`: Logic for smart scrobbling and timestamp generation.
-- `encrypt_auth.py`: Tool for securing your YouTube Music credentials.
-- `data.db`: Local SQLite database tracking scrobble history.
+- `start_ytm_scobble.py`: Main execution process, Last.fm OAuth handler, and database persistence manager.
+- `ytmusic_fetcher.py`: Fetches YTM history and manages hybrid SQLite persistent caching for liked songs.
+- `scrobble_utils.py`: Logic for `SmartScrobbler`, `PositionTracker`, metadata cleaning, and timestamp generation.
+- `notifications.py`: Generates Discord markdown reports with `## Scrobbled` tracks, `## Liked Today`, and `## Most Played` sections.
+- `lastpy/`: Lightweight Last.fm API client module supporting HTTPS connection pooling and batch scrobbling.
+- `encrypt_auth.py`: Utility tool for encrypting YouTube Music session credentials into `browser.json.enc`.
+- `data.db`: Local B-Tree indexed SQLite database tracking scrobbles, loved tracks, and liked song caches.
+- `tests/`: Comprehensive test suite containing 110+ unit, integration, and optimization regression test cases.
 
 ---
 

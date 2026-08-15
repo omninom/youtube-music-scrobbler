@@ -1,12 +1,56 @@
 #!/usr/bin/env python3
 """
-Notification utility module for sending Discord notifications
-about scrobbling results.
+Notification utility module for formatting and sending Discord notifications
+about scrobbling results, featuring a top-5 Scrobbled list with +X overflow,
+Liked Today tracks, Most Played Track, and Most Played Artist cards.
 """
 import os
 import requests
+import urllib.parse
 from datetime import UTC, datetime
-from typing import Mapping, Optional
+from typing import Optional
+
+
+def build_ytmusic_url(title: str, artist: Optional[str] = None, video_id: Optional[str] = None) -> str:
+    """
+    Build YouTube Music URL for a song.
+
+    Uses a direct video link if video_id is present, otherwise falls back to a
+    YouTube Music search query URL.
+
+    Args:
+        title: Song title string.
+        artist: Optional artist name string.
+        video_id: Optional YouTube Music video ID string.
+
+    Returns:
+        YouTube Music URL string.
+    """
+    if video_id:
+        return f"https://music.youtube.com/watch?v={video_id}"
+    query_parts = [title]
+    if artist:
+        query_parts.append(artist)
+    query = " ".join(query_parts)
+    return f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"
+
+
+def format_song_with_link(title: str, artist: Optional[str] = None, video_id: Optional[str] = None) -> str:
+    """
+    Format song name as a Discord-compatible markdown hyperlink to YouTube Music.
+
+    Args:
+        title: Song title string.
+        artist: Optional artist name string.
+        video_id: Optional YouTube Music video ID string.
+
+    Returns:
+        Formatted markdown hyperlink string `[Title — Artist](url)` or `[Title](url)`.
+    """
+    display_text = f"{title} — {artist}" if artist else title
+    url = build_ytmusic_url(title, artist, video_id)
+    return f"[{display_text}]({url})"
+
 
 
 def build_sync_footer_text(
@@ -45,16 +89,6 @@ def format_listening_duration(total_minutes: int) -> str:
     return f"{listening_hours}h {listening_mins}m"
 
 
-def extract_flow_minutes(flow: Optional[Mapping[str, int]]) -> tuple[int, int, int]:
-    """Get Evening, Afternoon, Late Night minutes with safe defaults."""
-    flow = flow or {}
-    return (
-        int(flow.get("Evening", 0)),
-        int(flow.get("Afternoon", 0)),
-        int(flow.get("Late Night", 0)),
-    )
-
-
 def send_success_notification(
     history_count: int,
     today_count: int,
@@ -70,10 +104,8 @@ def send_success_notification(
     love_failed_songs: list = None,
     unique_artist_count: int = 0,
     unique_album_count: int = 0,
-    listening_flow_minutes: Optional[Mapping[str, int]] = None,
-    most_played_artist: str = "Unknown",
-    longest_streak_tracks: int = 0,
-    longest_streak_minutes: int = 0,
+    most_played_song: Optional[str] = None,
+    most_played_artist: Optional[str] = None,
     report_now: Optional[datetime] = None
 ):
     """
@@ -96,10 +128,8 @@ def send_success_notification(
         love_failed_songs: List of songs that failed to be loved (optional)
         unique_artist_count: Unique artists from today's songs
         unique_album_count: Unique albums from today's songs
-        listening_flow_minutes: Approx minute distribution across dayparts
-        most_played_artist: Most frequently played artist today
-        longest_streak_tracks: Longest contiguous streak in today's sequence
-        longest_streak_minutes: Duration of longest streak in minutes
+        most_played_song: Most frequently played song today if played > 1 time
+        most_played_artist: Most frequently played artist today if played > 1 time
         report_now: timezone-aware datetime to use for report date
     """
     webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
@@ -121,43 +151,60 @@ def send_success_notification(
     now = report_now or datetime.now(UTC)
     title_date = format_report_date(now)
 
-    estimated_minutes = scrobbled_count * 4
+    display_scrobbled_count = today_count if today_count > 0 else scrobbled_count
+    estimated_minutes = display_scrobbled_count * 4
     listening_value = format_listening_duration(estimated_minutes)
-
-    liked_today_lines = []
-    if loved_songs:
-        max_items = 5
-        liked_today_lines.extend([f"- {song}" for song in loved_songs[:max_items]])
-        if len(loved_songs) > max_items:
-            liked_today_lines.append(f"- +{len(loved_songs) - max_items} more")
-    else:
-        liked_today_lines.append("- None")
-
-    evening_minutes, afternoon_minutes, late_night_minutes = extract_flow_minutes(listening_flow_minutes)
 
     body_lines = [
         f"# Scrobble Report — {title_date}",
         "```txt",
-        f"Scrobbled    {scrobbled_count} tracks",
+        f"Scrobbled    {display_scrobbled_count} tracks",
         f"Listening    {listening_value}",
         f"Artists      {unique_artist_count}",
         f"Albums       {unique_album_count}",
         "```",
-        "## Liked Today",
-        *liked_today_lines,
-        "## Listening Flow",
-        f"- Evening • {evening_minutes}m",
-        f"- Afternoon • {afternoon_minutes}m",
-        f"- Late Night • {late_night_minutes}m",
-        "## Highlights",
-        f"- Longest Streak — {longest_streak_tracks} tracks • {longest_streak_minutes}m",
-        f"- Most Played — {most_played_artist}",
     ]
+
+    has_liked = bool(loved_songs)
+
+    if scrobbled_songs:
+        body_lines.append("## Scrobbled")
+        max_items = 5
+        body_lines.extend([f"- {song}" for song in scrobbled_songs[:max_items]])
+        if len(scrobbled_songs) > max_items:
+            body_lines.append(f"- +{len(scrobbled_songs) - max_items} more")
+
+    if has_liked:
+        body_lines.append("## Liked Today")
+        max_items = 5
+        body_lines.extend([f"- {song}" for song in loved_songs[:max_items]])
+        if len(loved_songs) > max_items:
+            body_lines.append(f"- +{len(loved_songs) - max_items} more")
+
+    if most_played_song:
+        body_lines.append("## Most Played Track")
+        if isinstance(most_played_song, tuple):
+            song_link, repeat_count = most_played_song
+            body_lines.append(f"- Track • {song_link}")
+            body_lines.append(f"- Repeat • {repeat_count} Times")
+        else:
+            body_lines.append(f"- Track • {most_played_song}")
+
+    if most_played_artist:
+        body_lines.append("## Most Played Artist")
+        if isinstance(most_played_artist, tuple):
+            artist_name, total_songs = most_played_artist
+            body_lines.append(f"- Artist • {artist_name}")
+            body_lines.append(f"- Songs Played Today • {total_songs}")
+        else:
+            body_lines.append(f"- Artist • {most_played_artist}")
+
     if love_failed_count > 0 and love_failed_songs:
         body_lines.append("## Love Failures")
         body_lines.extend([f"- {song}" for song in love_failed_songs[:10]])
         if len(love_failed_songs) > 10:
             body_lines.append(f"- +{len(love_failed_songs) - 10} more")
+
 
     body_lines.append("")
     body_lines.append(f"> {footer_text}")
