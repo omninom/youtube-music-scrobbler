@@ -1,3 +1,14 @@
+"""
+Main execution daemon and orchestrator for YouTube Music Last.fm Scrobbler.
+
+Handles:
+- Last.fm OAuth authentication and session key resolution.
+- YouTube Music history fetching and timezone-aware filtering.
+- Dual-pattern position tracking & replay detection.
+- B-Tree indexed SQLite database storage with single-commit batch transactions.
+- Lazy-loaded hybrid persistent caching for liked songs.
+- Discord notification dispatch with Scrobbled, Liked, and Most Played summaries.
+"""
 import os
 import argparse
 import http.server
@@ -9,7 +20,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 import logging
 from collections import Counter
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import set_key
@@ -21,23 +32,15 @@ from date_detection import (
     get_unknown_date_values,
     is_today_song,
 )
-from notifications import send_success_notification
+from notifications import format_song_with_link, send_success_notification
 from scrobble_utils import FailureType, PositionTracker, SmartScrobbler
 from song_matching import normalize_song_key
 from ytmusic_fetcher import get_ytmusic_history, get_ytmusic_liked_song_keys
 
-AVG_TRACK_MINUTES = 4
 DEFAULT_SCROBBLE_TIMEZONE = "Asia/Kolkata"
 
 
-def _fallback_scrobble_timezone() -> tzinfo:
-    """Return a fixed offset fallback when IANA timezone data is unavailable."""
-    if DEFAULT_SCROBBLE_TIMEZONE == "Asia/Kolkata":
-        return timezone(timedelta(hours=5, minutes=30), name=DEFAULT_SCROBBLE_TIMEZONE)
-    return timezone.utc
-
-
-def get_scrobble_timezone() -> tzinfo:
+def get_scrobble_timezone() -> ZoneInfo:
     """Resolve configured timezone with safe fallback."""
     timezone_name = os.environ.get("SCROBBLE_TIMEZONE", DEFAULT_SCROBBLE_TIMEZONE).strip() or DEFAULT_SCROBBLE_TIMEZONE
     try:
@@ -48,14 +51,7 @@ def get_scrobble_timezone() -> tzinfo:
             timezone_name,
             DEFAULT_SCROBBLE_TIMEZONE,
         )
-        try:
-            return ZoneInfo(DEFAULT_SCROBBLE_TIMEZONE)
-        except ZoneInfoNotFoundError:
-            logger.warning(
-                "Default timezone '%s' is unavailable. Falling back to a fixed offset.",
-                DEFAULT_SCROBBLE_TIMEZONE,
-            )
-            return _fallback_scrobble_timezone()
+        return ZoneInfo(DEFAULT_SCROBBLE_TIMEZONE)
 
 
 def get_scrobble_now() -> datetime:
@@ -63,55 +59,107 @@ def get_scrobble_now() -> datetime:
     return datetime.now(get_scrobble_timezone())
 
 
-def compute_most_played_artist(today_songs: List[Dict[str, str]]) -> str:
-    """Return the most frequently occurring artist in today's songs."""
-    artists = [song.get("artist") for song in today_songs if song.get("artist")]
-    if not artists:
-        return "Unknown"
-
-    counts = Counter(artists)
-    first_index = {}
-    for idx, artist in enumerate(artists):
-        if artist not in first_index:
-            first_index[artist] = idx
-    return min(counts.keys(), key=lambda artist: (-counts[artist], first_index[artist], artist))
-
-
-def compute_longest_streak(today_songs: List[Dict[str, str]], avg_track_minutes: int = AVG_TRACK_MINUTES) -> Tuple[int, int]:
+def compute_most_played_song(today_songs: List[Dict[str, Optional[str]]], cursor: Optional[sqlite3.Cursor] = None) -> Optional[Tuple[str, int]]:
     """
-    Longest contiguous streak in today's ordered history.
-    Since history is contiguous by list order, this is today's song count.
+    Compute the most frequently played song in today's songs.
+
+    Only returns a song if it was played more than once (count > 1).
+    Checks today's history list first; if YouTube Music returned single items,
+    falls back to querying persistent play_count from SQLite database.
+
+    Args:
+        today_songs: List of song dictionaries containing 'title', 'artist', and optional 'videoId'.
+        cursor: Optional SQLite cursor to query persistent play_count from data.db.
+
+    Returns:
+        Tuple of (title_str, repeat_count) if max plays > 1, otherwise None.
     """
-    tracks = len(today_songs)
-    return tracks, tracks * avg_track_minutes
+    valid_songs = [
+        (song.get("title"), song.get("artist"))
+        for song in today_songs
+        if song.get("title")
+    ]
+    if not valid_songs:
+        return None
 
+    counts = Counter(valid_songs)
+    _, max_count = counts.most_common(1)[0]
+    if max_count > 1:
+        first_index = {}
+        for idx, song in enumerate(valid_songs):
+            if song not in first_index:
+                first_index[song] = idx
 
-def _bucket_for_hour(hour: int) -> Optional[str]:
-    if 0 <= hour <= 5:
-        return "Late Night"
-    if 12 <= hour <= 16:
-        return "Afternoon"
-    if 17 <= hour <= 21:
-        return "Evening"
+        top_candidates = [s for s, c in counts.items() if c == max_count]
+        best_title, best_artist = min(top_candidates, key=lambda s: first_index[s])
+
+        video_id = None
+        for song in today_songs:
+            if song.get("title") == best_title and song.get("artist") == best_artist:
+                video_id = song.get("videoId")
+                break
+
+        title_str = f"{best_title} — {best_artist}" if best_artist else best_title
+        return (title_str, max_count)
+
+    if cursor:
+        try:
+            row = cursor.execute(
+                'SELECT track_name, artist_name, play_count FROM scrobbles WHERE play_count > 1 ORDER BY play_count DESC, scrobbled_at DESC'
+            ).fetchone()
+            if row:
+                best_title, best_artist, play_count = row
+                title_str = f"{best_title} — {best_artist}" if best_artist else best_title
+                return (title_str, play_count)
+        except Exception:
+            pass
+
     return None
 
 
-def compute_listening_flow(
-    song_count: int,
-    reference_time: Optional[datetime] = None,
-    avg_track_minutes: int = AVG_TRACK_MINUTES
-) -> Dict[str, int]:
-    """Approximate listening flow by backfilling synthetic play timeline from reference time."""
-    reference = reference_time or get_scrobble_now()
-    totals = {"Evening": 0, "Afternoon": 0, "Late Night": 0}
-    total_minutes = max(0, song_count * avg_track_minutes)
+def compute_most_played_artist(today_songs: List[Dict[str, Optional[str]]], cursor: Optional[sqlite3.Cursor] = None) -> Optional[Tuple[str, int]]:
+    """
+    Compute the most frequently played artist in today's songs.
 
-    for minute_offset in range(total_minutes):
-        minute_ts = reference - timedelta(minutes=minute_offset)
-        bucket = _bucket_for_hour(minute_ts.hour)
-        if bucket:
-            totals[bucket] += 1
-    return totals
+    Only returns an artist if they were played more than once (count > 1).
+    In case of ties, the artist that appeared first in today's history is returned.
+
+    Args:
+        today_songs: List of song dictionaries containing 'artist'.
+        cursor: Optional SQLite cursor to query persistent play_count from data.db.
+
+    Returns:
+        Tuple of (artist_name, total_plays) if max plays > 1, otherwise None.
+    """
+    artists = [song.get("artist") for song in today_songs if song.get("artist")]
+    if not artists:
+        return None
+
+    counts = Counter(artists)
+    _, max_count = counts.most_common(1)[0]
+    if max_count > 1:
+        first_index = {}
+        for idx, artist in enumerate(artists):
+            if artist not in first_index:
+                first_index[artist] = idx
+
+        top_candidates = [a for a, c in counts.items() if c == max_count]
+        best_artist = min(top_candidates, key=lambda a: first_index[a])
+        return (best_artist, max_count)
+
+    if cursor:
+        try:
+            row = cursor.execute(
+                'SELECT artist_name, SUM(play_count) as total_plays FROM scrobbles GROUP BY artist_name HAVING total_plays > 1 ORDER BY total_plays DESC'
+            ).fetchone()
+            if row:
+                artist_name, total_plays = row
+                return (artist_name, total_plays)
+        except Exception:
+            pass
+
+    return None
+
 
 
 # --- Last.fm Authentication ---
@@ -174,7 +222,8 @@ class ImprovedProcess:
                 scrobbled_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 array_position INTEGER,
                 max_array_position INTEGER,
-                is_first_time_scrobble BOOLEAN DEFAULT FALSE
+                is_first_time_scrobble BOOLEAN DEFAULT FALSE,
+                play_count INTEGER DEFAULT 1
             )
         ''')
         
@@ -188,6 +237,11 @@ class ImprovedProcess:
         except sqlite3.OperationalError:
             pass
 
+        try:
+            cursor.execute('ALTER TABLE scrobbles ADD COLUMN play_count INTEGER DEFAULT 1')
+        except sqlite3.OperationalError:
+            pass
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS loved_tracks (
                 id INTEGER PRIMARY KEY,
@@ -197,6 +251,23 @@ class ImprovedProcess:
                 UNIQUE(track_name, artist_name)
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS liked_songs_cache (
+                id INTEGER PRIMARY KEY,
+                track_name TEXT,
+                artist_name TEXT,
+                normalized_title TEXT,
+                normalized_artist TEXT,
+                fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(normalized_title, normalized_artist)
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_scrobbles_composite ON scrobbles (track_name, artist_name, album_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_scrobbles_play_count ON scrobbles (play_count)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_loved_tracks_composite ON loved_tracks (track_name, artist_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_liked_songs_cache_norm ON liked_songs_cache (normalized_title, normalized_artist)')
 
         self.conn.commit()
         cursor.close()
@@ -245,12 +316,11 @@ class ImprovedProcess:
 
         if self.dry_run:
             logger.info("--- DRY RUN MODE ENABLED ---")
-            logger.info("No scrobbles will be sent to Last.fm and database will not be updated.")
+            logger.info("No scrobbles will be sent to Last.fm. History positions will still persist to data.db.")
 
         logger.info("Fetching YouTube Music history...")
         try:
             history = get_ytmusic_history()
-            liked_song_keys = get_ytmusic_liked_song_keys()
         except FileNotFoundError as e:
             logger.error(f"{e}")
             logger.error("Please ensure 'browser.json' or 'browser.json.enc' with YTMUSIC_AUTH_KEY is provided.")
@@ -269,25 +339,26 @@ class ImprovedProcess:
         cursor = self.conn.cursor()
         db_songs = cursor.execute('''
             SELECT track_name, artist_name, album_name, array_position, 
-                   max_array_position, is_first_time_scrobble
+                   max_array_position, is_first_time_scrobble, scrobbled_at
             FROM scrobbles
         ''').fetchall()
         
-        database_songs = [{'title': r[0], 'artist': r[1], 'album': r[2], 'array_position': r[3], 'max_array_position': r[4] or r[3], 'is_first_time': bool(r[5])} for r in db_songs]
+        database_songs = [{'title': r[0], 'artist': r[1], 'album': r[2], 'array_position': r[3], 'max_array_position': r[4] or r[3], 'is_first_time': bool(r[5]), 'scrobbled_at': r[6]} for r in db_songs]
 
         is_first_time = len(database_songs) == 0
         
         if database_songs:
-            songs_to_delete = [db_song for db_song in database_songs if not any(
-                (today_song['title'] == db_song['title'] and
-                 today_song['artist'] == db_song['artist'] and
-                 today_song['album'] == db_song['album'])
-                for today_song in today_songs
-            )]
+            today_keys = {(t['title'], t['artist'], t['album']) for t in today_songs}
+            songs_to_delete = [
+                db_song for db_song in database_songs
+                if (db_song['title'], db_song['artist'], db_song['album']) not in today_keys
+            ]
 
             if songs_to_delete:
-                for song in songs_to_delete:
-                    cursor.execute('DELETE FROM scrobbles WHERE track_name = ? AND artist_name = ? AND album_name = ?', (song['title'], song['artist'], song['album']))
+                cursor.executemany(
+                    'DELETE FROM scrobbles WHERE track_name = ? AND artist_name = ? AND album_name = ?',
+                    [(song['title'], song['artist'], song['album']) for song in songs_to_delete]
+                )
                 self.conn.commit()
 
         songs_to_process = self.position_tracker.detect_songs_to_scrobble(
@@ -309,6 +380,17 @@ class ImprovedProcess:
         loved_songs = []
         love_failed_songs = []
 
+        liked_song_keys = None
+
+        scrobbles_map = {
+            (r[0], r[1], r[2]): (r[3], r[4], r[5])
+            for r in cursor.execute('SELECT track_name, artist_name, album_name, id, max_array_position, play_count FROM scrobbles').fetchall()
+        }
+        loved_tracks_set = {
+            (r[0], r[1])
+            for r in cursor.execute('SELECT track_name, artist_name FROM loved_tracks').fetchall()
+        }
+
         for item in songs_to_process:
             song = item['song']
             position = item['position']
@@ -326,40 +408,48 @@ class ImprovedProcess:
                         scrobble_position += 1
                         scrobbled_songs.append(f"{song['title']} — {song['artist']}")
 
-                        song_key = normalize_song_key(song.get('title'), song.get('artist'))
-                        already_loved = cursor.execute(
-                            'SELECT 1 FROM loved_tracks WHERE track_name = ? AND artist_name = ?',
-                            (song['title'], song['artist'])
-                        ).fetchone()
-                        if song_key in liked_song_keys and not already_loved:
-                            love_status = self.scrobbler.love_song(song, self.session)
-                            if love_status == "loved":
-                                loved_count += 1
-                                loved_songs.append(f"{song['title']} — {song['artist']}")
-                                if not self.dry_run:
+                        already_loved = (song['title'], song['artist']) in loved_tracks_set
+                        if not already_loved:
+                            if liked_song_keys is None:
+                                try:
+                                    liked_song_keys = get_ytmusic_liked_song_keys(db_conn=self.conn)
+                                except TypeError:
+                                    liked_song_keys = get_ytmusic_liked_song_keys()
+                            song_key = normalize_song_key(song.get('title'), song.get('artist'))
+                            if song_key in liked_song_keys:
+                                love_status = self.scrobbler.love_song(song, self.session)
+                                if love_status == "loved":
+                                    loved_count += 1
+                                    loved_songs.append(format_song_with_link(song['title'], song.get('artist'), song.get('videoId')))
+                                    loved_tracks_set.add((song['title'], song['artist']))
                                     cursor.execute(
                                         'INSERT OR IGNORE INTO loved_tracks (track_name, artist_name) VALUES (?, ?)',
                                         (song['title'], song['artist'])
                                     )
-                            elif love_status == "failed":
-                                love_failed_count += 1
-                                love_failed_songs.append(f"{song['title']} — {song['artist']}")
+                                elif love_status == "failed":
+                                    love_failed_count += 1
+                                    love_failed_songs.append(f"{song['title']} — {song['artist']}")
                     else:
                         failed_songs.append(f"{song['title']} by {song['artist']}")
                 
-                if not self.dry_run:
-                    existing_song = cursor.execute('SELECT id, max_array_position FROM scrobbles WHERE track_name = ? AND artist_name = ? AND album_name = ?', (song['title'], song['artist'], song['album'])).fetchone()
-                    
-                    if existing_song:
-                        song_id, current_max = existing_song
-                        new_max = max(current_max or position, position)
-                        cursor.execute('UPDATE scrobbles SET array_position = ?, max_array_position = ?, scrobbled_at = CURRENT_TIMESTAMP WHERE id = ?', (position, new_max, song_id))
-                    else:
-                        cursor.execute('INSERT INTO scrobbles (track_name, artist_name, album_name, array_position, max_array_position, is_first_time_scrobble) VALUES (?, ?, ?, ?, ?, ?)', (song['title'], song['artist'], song['album'], position, position, is_first_time))
-                    
-                    self.conn.commit()
+                reason = item.get('reason')
+                should_scrobble = item.get('should_scrobble', False)
+
+                song_key = (song['title'], song['artist'], song['album'])
+                existing_song = scrobbles_map.get(song_key)
+                
+                if existing_song:
+                    song_id, current_max, current_play_count = existing_song
+                    new_max = max(current_max or position, position)
+                    is_replay = (reason in ('reproduction', 'loop_reproduction')) or (should_scrobble and reason != 'first_time_no_scrobble' and position < (current_max or position))
+                    new_play_count = (current_play_count or 1) + (1 if is_replay else 0)
+                    cursor.execute('UPDATE scrobbles SET array_position = ?, max_array_position = ?, play_count = ?, scrobbled_at = CURRENT_TIMESTAMP WHERE id = ?', (position, new_max, new_play_count, song_id))
+                    scrobbles_map[song_key] = (song_id, new_max, new_play_count)
                 else:
-                    logger.debug(f"Dry run: Skipping database update for {song['title']}")
+                    initial_play_count = 1
+                    cursor.execute('INSERT INTO scrobbles (track_name, artist_name, album_name, array_position, max_array_position, is_first_time_scrobble, play_count) VALUES (?, ?, ?, ?, ?, ?, ?)', (song['title'], song['artist'], song['album'], position, position, is_first_time, initial_play_count))
+                    song_id = cursor.lastrowid
+                    scrobbles_map[song_key] = (song_id, position, initial_play_count)
                 
             except Exception as error:
                 failure_type = self.scrobbler.categorize_error(error)
@@ -369,6 +459,17 @@ class ImprovedProcess:
                     break
                 failed_songs.append(f"{song['title']} by {song['artist']}")
 
+        self.conn.commit()
+
+        report_now = get_scrobble_now()
+        most_played_song = compute_most_played_song(today_songs, cursor=cursor)
+        most_played_artist = compute_most_played_artist(today_songs, cursor=cursor)
+
+        try:
+            total_today_scrobbles = cursor.execute('SELECT SUM(play_count) FROM scrobbles').fetchone()[0] or len(today_songs)
+        except Exception:
+            total_today_scrobbles = len(today_songs)
+
         cursor.close()
 
         logger.info(
@@ -376,22 +477,10 @@ class ImprovedProcess:
             f"Failed: {len(failed_songs)}, Loved: {loved_count}, LoveFailed: {love_failed_count}"
         )
 
-        report_now = get_scrobble_now()
-        most_played_artist = compute_most_played_artist(today_songs)
-        longest_streak_tracks, longest_streak_minutes = compute_longest_streak(
-            today_songs,
-            avg_track_minutes=AVG_TRACK_MINUTES
-        )
-        listening_flow_minutes = compute_listening_flow(
-            song_count=len(today_songs),
-            reference_time=report_now,
-            avg_track_minutes=AVG_TRACK_MINUTES
-        )
-
         # Send Discord notification only if there were songs to scrobble
         send_success_notification(
             history_count=len(history),
-            today_count=len(today_songs),
+            today_count=total_today_scrobbles,
             existing_count=existing_count,
             to_scrobble_count=total_to_scrobble,
             scrobbled_count=songs_scrobbled,
@@ -404,10 +493,8 @@ class ImprovedProcess:
             love_failed_songs=love_failed_songs if love_failed_songs else None,
             unique_artist_count=len({s.get("artist") for s in today_songs if s.get("artist")}),
             unique_album_count=len({s.get("album") for s in today_songs if s.get("album")}),
-            listening_flow_minutes=listening_flow_minutes,
+            most_played_song=most_played_song,
             most_played_artist=most_played_artist,
-            longest_streak_tracks=longest_streak_tracks,
-            longest_streak_minutes=longest_streak_minutes,
             report_now=report_now
         )
 
